@@ -1,0 +1,16 @@
+{
+  "slots": 5,
+  "quietSlots": 2,
+  "schedule": [
+    { "days": ["mon", "tue", "wed", "thu", "fri"], "from": "09:00", "to": "18:00", "slots": 3 },
+    { "days": ["sat", "sun"], "from": "14:00", "to": "17:00", "slots": 1 },
+    { "from": "23:00", "to": "06:00", "slots": 8 }
+  ],
+  "breaker": {
+    "tightSwapGb": 10,
+    "criticalSwapGb": 14,
+    "tightLoad": 80,
+    "criticalLoad": 150,
+    "killUngated": true
+  }
+}

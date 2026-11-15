@@ -1,0 +1,656 @@
+#!/usr/bin/python3
+"""heavy: one machine-wide queue for expensive commands, with a pressure breaker.
+
+    heavy <command...>      wait for a free slot, then run the command at low priority
+    heavy -- <command...>   the same, for a command named like one of the words below
+    heavy status            slots, what is running, what is queued, pressure
+    heavy config            where the config file is and what is in effect
+    heavy quiet [for]       drop to the quiet slot count (default 3h)
+    heavy cap <n> [for]     set the slot count by hand (default 3h)
+    heavy normal            clear a quiet/cap override
+    heavy watchdog          the breaker loop (run by launchd); --once --dry-run to inspect
+
+[for] is a length (90m, 2h, 2h30m) or a clock time to stop at (19:00).
+
+Commands start in the order they asked. The slot count comes from, in order:
+the breaker (memory or load pressure), a quiet/cap override, the schedule in the
+config, the normal count.
+
+Config: ~/.config/heavy/config.json. State: /tmp/heavy-<uid>/. See README.md.
+"""
+import ctypes
+import fcntl
+import json
+import os
+import re
+import signal
+import subprocess
+import sys
+import time
+
+STATE = os.environ.get("HEAVY_STATE_DIR") or "/tmp/heavy-%d" % os.getuid()
+CONF = os.environ.get("HEAVY_CONFIG_DIR") or os.path.expanduser("~/.config/heavy")
+RUN, QUEUE, KILLED = (os.path.join(STATE, d) for d in ("run", "queue", "killed"))
+PRESSURE = os.path.join(STATE, "pressure.json")
+CONFIG = os.path.join(CONF, "config.json")
+OVERRIDE = os.path.join(CONF, "override.json")
+
+DAYS = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"]
+TICK = 20
+PRESSURE_FRESH = 90
+EX_TEMPFAIL = 75
+
+# Test runs, type-checks and builds as `ps` prints them when started without
+# heavy: `node <project>/node_modules/.bin/<tool> ...`. Anchored at the start of
+# the command line, so a dev server, or a process that only mentions one of
+# these tools in its arguments, does not match.
+NODE_BIN = r"^(\S*/)?node \S*/node_modules/\.bin/"
+UNGATED = [NODE_BIN + tool + r"( |$)" for tool in
+           ("playwright test", "vitest", "jest", "tsc", "next build", "vite build")]
+
+
+def warn(msg):
+    print("heavy: " + msg, file=sys.stderr, flush=True)
+
+
+def read_json(path):
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except FileNotFoundError:
+        return None
+    except (OSError, ValueError) as e:
+        warn("ignoring %s: %s" % (path, e))
+        return None
+
+
+def write_json(path, value):
+    tmp = "%s.%d.tmp" % (path, os.getpid())
+    with open(tmp, "w") as f:
+        json.dump(value, f)
+    os.replace(tmp, path)
+
+
+def sysctl(name, value):
+    libc = ctypes.CDLL(None, use_errno=True)
+    size = ctypes.c_size_t(ctypes.sizeof(value))
+    if libc.sysctlbyname(name.encode(), ctypes.byref(value), ctypes.byref(size), None, 0) != 0:
+        raise OSError(ctypes.get_errno(), "sysctl " + name)
+    return value
+
+
+# --- config ----------------------------------------------------------------
+
+
+def defaults():
+    cores = os.cpu_count() or 4
+    ram_gb = sysctl("hw.memsize", ctypes.c_uint64()).value / 2**30
+    return {
+        "slots": max(2, cores // 2),
+        "quietSlots": 2,
+        "tightSlots": 1,
+        "nice": 10,
+        "schedule": [],
+        "breaker": {
+            "tightSwapGb": round(ram_gb * 0.6, 1),
+            "criticalSwapGb": round(ram_gb * 0.85, 1),
+            "tightLoad": cores * 8,
+            "criticalLoad": cores * 15,
+            "killUngated": True,
+            "ungated": UNGATED,
+        },
+    }
+
+
+def whole(value, least=0):
+    return isinstance(value, int) and not isinstance(value, bool) and value >= least
+
+
+def clock(text):
+    """Minutes since midnight for "HH:MM", or None."""
+    m = re.fullmatch(r"(\d{1,2}):(\d{2})", text) if isinstance(text, str) else None
+    if not m:
+        return None
+    h, mins = int(m.group(1)), int(m.group(2))
+    return h * 60 + mins if (h < 24 and mins < 60) or (h, mins) == (24, 0) else None
+
+
+def window(w, quiet_slots):
+    """A checked schedule window, or the reason it is not one."""
+    if not isinstance(w, dict):
+        return None, "is not an object"
+    days = w.get("days", DAYS)
+    if not (isinstance(days, list) and days and all(d in DAYS for d in days)):
+        return None, '"days" must be a list of ' + ", ".join(DAYS)
+    start, end = clock(w.get("from")), clock(w.get("to"))
+    if start is None or end is None or start == end:
+        return None, '"from" and "to" must be two different HH:MM times'
+    slots = w.get("slots", quiet_slots)
+    if not whole(slots):
+        return None, '"slots" must be a whole number'
+    who = "daily" if len(set(days)) == 7 else ", ".join(days)
+    return {"days": days, "from": start, "to": end, "slots": slots,
+            "label": "%s %s-%s" % (who, w["from"], w["to"])}, None
+
+
+_loaded = (None, None)
+
+
+def config():
+    """Defaults with the user's file on top. A setting that does not check out is
+    reported and skipped, so a typo cannot stop every command on the machine."""
+    global _loaded
+    try:
+        stamp = os.stat(CONFIG).st_mtime_ns
+    except FileNotFoundError:
+        stamp = 0
+    if _loaded[0] == stamp:
+        return _loaded[1]
+
+    def skip(name, why):
+        warn("%s: ignoring %s: %s" % (CONFIG, name, why))
+
+    cfg = defaults()
+    user = read_json(CONFIG) if stamp else {}
+    if not isinstance(user, dict):
+        if user is not None:
+            skip("the file", "it must hold one JSON object")
+        user = {}
+    for key, least in (("slots", 1), ("quietSlots", 0), ("tightSlots", 0), ("nice", 0)):
+        if key in user:
+            if whole(user[key], least):
+                cfg[key] = user[key]
+            else:
+                skip(key, "it must be a whole number, %d or more" % least)
+
+    windows = user.get("schedule", [])
+    if not isinstance(windows, list):
+        skip("schedule", "it must be a list of windows")
+        windows = []
+    for i, w in enumerate(windows):
+        checked, why = window(w, cfg["quietSlots"])
+        if checked:
+            cfg["schedule"].append(checked)
+        else:
+            skip("schedule window %d" % (i + 1), why)
+
+    breaker = user.get("breaker", {})
+    if not isinstance(breaker, dict):
+        skip("breaker", "it must be an object")
+        breaker = {}
+    for key in ("tightSwapGb", "criticalSwapGb", "tightLoad", "criticalLoad"):
+        if key in breaker:
+            v = breaker[key]
+            if isinstance(v, (int, float)) and not isinstance(v, bool) and v >= 0:
+                cfg["breaker"][key] = v
+            else:
+                skip("breaker." + key, "it must be a number")
+    if "killUngated" in breaker:
+        if isinstance(breaker["killUngated"], bool):
+            cfg["breaker"]["killUngated"] = breaker["killUngated"]
+        else:
+            skip("breaker.killUngated", "it must be true or false")
+    patterns = breaker.get("ungated", cfg["breaker"]["ungated"])
+    if not isinstance(patterns, list):
+        skip("breaker.ungated", "it must be a list of regular expressions")
+        patterns = cfg["breaker"]["ungated"]
+    compiled = []
+    for p in patterns:
+        try:
+            compiled.append(re.compile(p))
+        except (re.error, TypeError) as e:
+            skip("breaker.ungated pattern %r" % (p,), str(e))
+    cfg["breaker"]["ungated"] = compiled
+
+    for key in user:
+        if key not in cfg:
+            skip(key, "there is no such setting")
+    for key in breaker:
+        if key not in cfg["breaker"]:
+            skip("breaker." + key, "there is no such setting")
+    _loaded = (stamp, cfg)
+    return cfg
+
+
+def scheduled(cfg, now):
+    """The schedule window in force now, the tightest if several overlap."""
+    lt = time.localtime(now)
+    today, yesterday = DAYS[lt.tm_wday], DAYS[lt.tm_wday - 1]
+    at = lt.tm_hour * 60 + lt.tm_min
+    active = []
+    for w in cfg["schedule"]:
+        if w["from"] < w["to"]:
+            on = today in w["days"] and w["from"] <= at < w["to"]
+        else:  # runs past midnight
+            on = (today in w["days"] and at >= w["from"]) or (yesterday in w["days"] and at < w["to"])
+        if on:
+            active.append(w)
+    return min(active, key=lambda w: w["slots"]) if active else None
+
+
+def pressure(now):
+    p = read_json(PRESSURE)
+    if isinstance(p, dict) and now - p.get("at", 0) < PRESSURE_FRESH:
+        return p
+    return None
+
+
+def capacity(cfg, now):
+    """Slots open to new commands right now, and why."""
+    cap, why = cfg["slots"], "normal"
+    ov = read_json(OVERRIDE)
+    window_now = scheduled(cfg, now)
+    if isinstance(ov, dict) and ov.get("until", 0) > now and whole(ov.get("slots")):
+        cap, why = ov["slots"], "set by hand until " + time.strftime("%a %H:%M", time.localtime(ov["until"]))
+    elif window_now:
+        cap, why = window_now["slots"], "schedule: " + window_now["label"]
+    p = pressure(now)
+    if p and p["level"] == "critical":
+        cap, why = 0, "breaker: " + p["reason"]
+    elif p and p["level"] == "tight" and cap > cfg["tightSlots"]:
+        cap, why = cfg["tightSlots"], "under pressure: " + p["reason"]
+    return cap, why
+
+
+# --- the queue -------------------------------------------------------------
+#
+# A running command holds a flock on run/<pid>; a waiting one holds a flock on
+# queue/<time>-<pid>. The kernel drops the lock when the holder dies, so a
+# crashed or killed wrapper never leaves a slot taken. Every create and every
+# liveness sweep happens under one mutex.
+
+
+class Mutex:
+    def __enter__(self):
+        for d in (RUN, QUEUE, KILLED):
+            os.makedirs(d, mode=0o700, exist_ok=True)
+        self.fd = os.open(os.path.join(STATE, "mutex"), os.O_CREAT | os.O_RDWR, 0o600)
+        fcntl.flock(self.fd, fcntl.LOCK_EX)
+
+    def __exit__(self, *exc):
+        os.close(self.fd)
+
+
+def hold(directory, name, info):
+    path = os.path.join(directory, name)
+    fd = os.open(path, os.O_CREAT | os.O_RDWR, 0o600)
+    fcntl.flock(fd, fcntl.LOCK_EX)
+    os.write(fd, json.dumps(info).encode())
+    return fd, path
+
+
+def release(held):
+    fd, path = held
+    try:
+        os.unlink(path)
+    except FileNotFoundError:
+        pass
+    os.close(fd)
+
+
+def live(directory):
+    """Names in the directory whose owner is still alive, oldest first. Call under the mutex."""
+    names = []
+    for name in sorted(os.listdir(directory)):
+        path = os.path.join(directory, name)
+        try:
+            fd = os.open(path, os.O_RDWR)
+        except FileNotFoundError:
+            continue
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            names.append(name)
+        else:
+            os.unlink(path)
+        finally:
+            os.close(fd)
+    return names
+
+
+def describe(argv):
+    text = " ".join(argv)
+    return text if len(text) <= 120 else text[:117] + "..."
+
+
+def span(seconds):
+    seconds = int(seconds)
+    if seconds < 60:
+        return "%ds" % seconds
+    if seconds < 3600:
+        return "%dm%02ds" % (seconds // 60, seconds % 60)
+    return "%dh%02dm" % (seconds // 3600, seconds % 3600 // 60)
+
+
+def wait_for_slot(argv):
+    info = {"pid": os.getpid(), "since": time.time(), "cwd": os.getcwd(), "cmd": describe(argv)}
+    ticket = None
+    told = 0.0
+    try:
+        while True:
+            with Mutex():
+                if ticket is None or not os.path.exists(ticket[1]):
+                    name = "%020d-%d" % (time.time_ns(), os.getpid())
+                    ticket = hold(QUEUE, name, info)
+                cap, why = capacity(config(), time.time())
+                running, queue = live(RUN), live(QUEUE)
+                ahead = queue.index(os.path.basename(ticket[1]))
+                if ahead < cap - len(running):
+                    slot = hold(RUN, str(os.getpid()), dict(info, since=time.time()))
+                    release(ticket)
+                    ticket = None
+                    break
+            now = time.time()
+            if now - told >= 300:
+                waited = "" if not told else " after " + span(now - info["since"])
+                warn("queued%s: %d of %d slots busy (%s), %d ahead in the queue"
+                     % (waited, len(running), cap, why, ahead))
+                told = now
+            time.sleep(1)
+    finally:
+        if ticket:
+            release(ticket)
+    waited = time.time() - info["since"]
+    if waited >= 5:
+        warn("started after %s in the queue" % span(waited))
+    return slot
+
+
+def run(argv):
+    if os.environ.get("HEAVY_HELD"):
+        # Already inside a gated command (a script that calls heavy again).
+        os.execvp(argv[0], argv)
+    for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+        signal.signal(sig, lambda s, _f: sys.exit(128 + s))
+    slot = wait_for_slot(argv)
+    try:
+        niceness = config()["nice"]
+        stops = (signal.SIGTERM, signal.SIGINT, signal.SIGHUP)
+
+        def start():
+            signal.pthread_sigmask(signal.SIG_UNBLOCK, stops)
+            os.nice(niceness)
+
+        # Held back while the command starts, so a signal can never land between
+        # the fork and the handlers that pass it on, leaving the command orphaned.
+        signal.pthread_sigmask(signal.SIG_BLOCK, stops)
+        try:
+            child = subprocess.Popen(argv, env=dict(os.environ, HEAVY_HELD="1"), preexec_fn=start)
+            for sig in stops:
+                signal.signal(sig, lambda s, _f: child.send_signal(s))
+        except FileNotFoundError:
+            warn("command not found: " + argv[0])
+            return 127
+        except PermissionError:
+            warn("cannot execute: " + argv[0])
+            return 126
+        finally:
+            signal.pthread_sigmask(signal.SIG_UNBLOCK, stops)
+        code = child.wait()
+        if code >= 0:
+            return code
+        note = os.path.join(KILLED, str(os.getpid()))
+        reason = read_json(note)
+        if reason:
+            os.unlink(note)
+            warn("stopped by the pressure breaker (%s). The machine is out of headroom. "
+                 "Wait until `heavy status` shows the pressure is ok, then rerun; "
+                 "do not run it outside heavy." % reason["reason"])
+            return EX_TEMPFAIL
+        return 128 - code
+    finally:
+        release(slot)
+
+
+# --- status, config and overrides ------------------------------------------
+
+
+def parse_until(text, now):
+    at = clock(text)
+    if at is not None and at < 24 * 60:
+        lt = time.localtime(now)
+        when = time.mktime(lt[:3] + (at // 60, at % 60, 0) + lt[6:])
+        return when if when > now else when + 86400
+    m = re.fullmatch(r"(?:(\d+)h)?(?:(\d+)m)?", text)
+    if m and text:
+        return now + int(m.group(1) or 0) * 3600 + int(m.group(2) or 0) * 60
+    raise SystemExit("heavy: '%s' is not a length (90m, 2h) or a clock time (19:00)" % text)
+
+
+def set_override(slots, how_long):
+    now = time.time()
+    until = parse_until(how_long or "3h", now)
+    os.makedirs(CONF, exist_ok=True)
+    write_json(OVERRIDE, {"slots": slots, "until": until})
+    print("heavy: %d slot%s until %s. Commands already running keep going; new ones queue."
+          % (slots, "" if slots == 1 else "s", time.strftime("%a %H:%M", time.localtime(until))))
+
+
+def entries(directory, names):
+    out = []
+    for name in names:
+        info = read_json(os.path.join(directory, name))
+        if info:
+            out.append(info)
+    return out
+
+
+def status():
+    cfg, now = config(), time.time()
+    with Mutex():
+        running, queued = entries(RUN, live(RUN)), entries(QUEUE, live(QUEUE))
+    cap, why = capacity(cfg, now)
+    print("%d of %d slots busy, %d queued (%s)" % (len(running), cap, len(queued), why))
+    home = os.path.expanduser("~")
+    for label, items in (("running", running), ("queued", queued)):
+        for e in items:
+            cwd = e["cwd"].replace(home, "~", 1)
+            print("  %-7s %6d  %7s  %-24s %s" % (label, e["pid"], span(now - e["since"]), cwd, e["cmd"]))
+    p = pressure(now)
+    if p:
+        print("pressure: %s (%s)" % (p["level"], p["reason"]))
+    else:
+        print("pressure: unknown, the watchdog is not reporting (install.sh starts it)")
+    return 0
+
+
+def show_config():
+    cfg = config()
+    b = cfg["breaker"]
+    found = "" if os.path.exists(CONFIG) else " (not there yet, so these are the defaults)"
+    print("config file: %s%s" % (CONFIG, found))
+    print("slots: %d (outside the schedule)" % cfg["slots"])
+    if cfg["schedule"]:
+        print("schedule:")
+        for w in cfg["schedule"]:
+            print("  %s: %d slot%s" % (w["label"], w["slots"], "" if w["slots"] == 1 else "s"))
+    else:
+        print("schedule: none, %d slots at all hours" % cfg["slots"])
+    print("`heavy quiet` drops to: %d" % cfg["quietSlots"])
+    print("priority: nice %d" % cfg["nice"])
+    print("breaker:")
+    print("  tight at swap %sG or load %s: %d slot%s"
+          % (b["tightSwapGb"], b["tightLoad"], cfg["tightSlots"], "" if cfg["tightSlots"] == 1 else "s"))
+    print("  critical at swap %sG or load %s: nothing starts, the newest heavy job is stopped every %ds"
+          % (b["criticalSwapGb"], b["criticalLoad"], TICK))
+    print("  also stops runs started without heavy: %s" % ("yes" if b["killUngated"] else "no"))
+    if b["killUngated"]:
+        for p in b["ungated"]:
+            print("    " + p.pattern)
+    print("Edits to the file apply to the next command and to commands already queued.")
+    return 0
+
+
+# --- the breaker -----------------------------------------------------------
+
+
+class XswUsage(ctypes.Structure):
+    _fields_ = [("total", ctypes.c_uint64), ("avail", ctypes.c_uint64), ("used", ctypes.c_uint64),
+                ("pagesize", ctypes.c_uint32), ("encrypted", ctypes.c_bool)]
+
+
+def measure(cfg):
+    b = cfg["breaker"]
+    swap = sysctl("vm.swapusage", XswUsage()).used / 2**30
+    load = os.getloadavg()[0]
+    kernel = sysctl("kern.memorystatus_vm_pressure_level", ctypes.c_int()).value
+    reading = "swap %.1fG, load %d" % (swap, load)
+    if swap >= b["criticalSwapGb"] or load >= b["criticalLoad"] or kernel >= 4:
+        level = "critical"
+    elif swap >= b["tightSwapGb"] or load >= b["tightLoad"]:
+        level = "tight"
+    else:
+        level = "ok"
+    if kernel >= 4:
+        reading += ", kernel reports memory critical"
+    return {"level": level, "reason": reading, "at": time.time()}
+
+
+def etime_seconds(text):
+    days, _, rest = text.rpartition("-")
+    total = 0
+    for part in rest.split(":"):
+        total = total * 60 + int(part)
+    return int(days or 0) * 86400 + total
+
+
+def processes():
+    out = subprocess.run(["/bin/ps", "-axo", "pid=,ppid=,uid=,etime=,command="],
+                         capture_output=True, text=True, check=True).stdout
+    table = {}
+    for line in out.splitlines():
+        parts = line.split(None, 4)
+        if len(parts) == 5 and int(parts[2]) == os.getuid():
+            table[int(parts[0])] = {"ppid": int(parts[1]), "age": etime_seconds(parts[3]), "cmd": parts[4]}
+    return table
+
+
+def is_ungated(cfg, cmd):
+    return any(p.match(cmd) for p in cfg["breaker"]["ungated"])
+
+
+def descendants(table, root):
+    kids = {}
+    for pid, p in table.items():
+        kids.setdefault(p["ppid"], []).append(pid)
+    out, todo = [], [root]
+    while todo:
+        pid = todo.pop()
+        for kid in kids.get(pid, []):
+            out.append(kid)
+            todo.append(kid)
+    return out
+
+
+def candidates(cfg):
+    """Heavy work that could be stopped, newest first: (age, root pid, pids to signal, label)."""
+    table = processes()
+    with Mutex():
+        gated = entries(RUN, live(RUN))
+    found, covered = [], set()
+    for e in gated:
+        tree = descendants(table, e["pid"])
+        covered.update(tree, [e["pid"]])
+        found.append((time.time() - e["since"], e["pid"], tree, "%s in %s" % (e["cmd"], e["cwd"])))
+    if cfg["breaker"]["killUngated"]:
+        for pid, p in table.items():
+            if pid not in covered and is_ungated(cfg, p["cmd"]):
+                found.append((p["age"], pid, [pid] + descendants(table, pid), "ungated " + p["cmd"][:120]))
+    return sorted(found, key=lambda c: c[0])
+
+
+def signal_all(pids, sig):
+    for pid in pids:
+        try:
+            os.kill(pid, sig)
+        except (ProcessLookupError, PermissionError):
+            pass
+
+
+def alive(pid):
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        pass
+    return True
+
+
+def log(msg):
+    print("%s heavy: %s" % (time.strftime("%F %T"), msg), flush=True)
+
+
+def shed(cfg, reason, dry_run):
+    found = candidates(cfg)
+    if dry_run:
+        for c in found:
+            print("  would stop (%s old, %d processes): %s" % (span(c[0]), max(1, len(c[2])), c[3]))
+        return
+    if not found:
+        log("critical (%s) and no heavy job left to stop; something else is using the machine" % reason)
+        return
+    age, root, pids, label = found[0]
+    log("critical (%s): stopping the newest heavy job, %s old, %d processes: %s"
+        % (reason, span(age), len(pids), label))
+    # A gated job's wrapper is left alone: it reads this note and reports why its command died.
+    write_json(os.path.join(KILLED, str(root)), {"reason": reason})
+    signal_all(pids, signal.SIGTERM)
+    deadline = time.time() + 5
+    while time.time() < deadline and any(alive(pid) for pid in pids):
+        time.sleep(0.2)
+    signal_all(pids, signal.SIGKILL)
+
+
+def watchdog(args):
+    once, dry_run = "--once" in args, "--dry-run" in args
+    last, critical_ticks = None, 0
+    while True:
+        cfg = config()
+        os.makedirs(STATE, mode=0o700, exist_ok=True)
+        p = measure(cfg)
+        if not dry_run:
+            write_json(PRESSURE, p)
+        if once:
+            print("%s (%s)" % (p["level"], p["reason"]))
+        elif p["level"] != last:
+            log("pressure %s (%s)" % (p["level"], p["reason"]))
+        last = p["level"]
+        critical_ticks = critical_ticks + 1 if p["level"] == "critical" else 0
+        # One reading can be a blip; two in a row is a trend. Then one job per tick.
+        if critical_ticks >= 2 or (once and (p["level"] == "critical" or dry_run)):
+            shed(cfg, p["reason"], dry_run)
+        if once:
+            return 0
+        time.sleep(TICK)
+
+
+def main(argv):
+    if not argv or argv[0] in ("help", "-h", "--help"):
+        print(__doc__.strip())
+        return 0
+    cmd, rest = argv[0], argv[1:]
+    if cmd == "--":
+        return run(rest) if rest else main([])
+    if cmd == "status" and not rest:
+        return status()
+    if cmd == "config" and not rest:
+        return show_config()
+    if cmd == "watchdog":
+        return watchdog(rest)
+    if cmd == "quiet" and len(rest) <= 1:
+        return set_override(config()["quietSlots"], rest[0] if rest else None)
+    if cmd == "cap" and 1 <= len(rest) <= 2 and rest[0].isdigit():
+        return set_override(int(rest[0]), rest[1] if len(rest) == 2 else None)
+    if cmd == "normal" and not rest:
+        try:
+            os.unlink(OVERRIDE)
+        except FileNotFoundError:
+            pass
+        print("heavy: back to the schedule")
+        return status()
+    return run(argv)
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
