@@ -1,9 +1,22 @@
 #!/bin/sh
 # Install or update heavy and its pressure watchdog for the current user. No sudo.
 #   ./install.sh               install, or update after a git pull
-#   ./install.sh --uninstall   remove the command and the watchdog (the config stays)
+#   ./install.sh --uninstall   remove the command, the watchdog and heavy's section in your
+#                              agents' instructions (the config stays)
+#   --agent-notes / --no-agent-notes   add heavy's section to your agents' global
+#                              instructions without asking, or skip it (default: ask)
 # HEAVY_BIN_DIR picks where the `heavy` command goes (default ~/.local/bin).
 set -eu
+
+uninstall=0 notes=ask
+for arg in "$@"; do
+	case $arg in
+	--uninstall) uninstall=1 ;;
+	--agent-notes) notes=yes ;;
+	--no-agent-notes) notes=no ;;
+	*) echo "install.sh: unknown option $arg" >&2; exit 2 ;;
+	esac
+done
 
 here=$(cd "$(dirname "$0")" && pwd)
 bin_dir=${HEAVY_BIN_DIR:-$HOME/.local/bin}
@@ -23,7 +36,8 @@ fi
 
 launchctl bootout "$domain/$label" 2>/dev/null || true
 
-if [ "${1:-}" = --uninstall ]; then
+if [ "$uninstall" = 1 ]; then
+	"$here/bin/heavy" agent-notes remove
 	rm -f "$agent" "$bin_dir/heavy"
 	echo "Removed the heavy command and its watchdog. Your config is still in $(dirname "$conf")."
 	exit 0
@@ -78,5 +92,11 @@ case ":$PATH:" in
 *) echo "Note: $bin_dir is not on your PATH. Add it, or rerun with HEAVY_BIN_DIR set to a directory that is." ;;
 esac
 
+case $notes in
+yes) "$here/bin/heavy" agent-notes install --yes ;;
+ask) "$here/bin/heavy" agent-notes install ;;
+esac
+
 sleep 2
+echo
 "$here/bin/heavy" status

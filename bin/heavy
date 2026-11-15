@@ -9,6 +9,8 @@
     heavy cap <n> [for]     set the slot count by hand (default 3h)
     heavy normal            clear a quiet/cap override
     heavy watchdog          the breaker loop (run by launchd); --once --dry-run to inspect
+    heavy agent-notes [show|install|remove] [--yes]
+                            the heavy section in your coding agents' global instructions
 
 [for] is a length (90m, 2h, 2h30m) or a clock time to stop at (19:00).
 
@@ -19,6 +21,7 @@ config, the normal count.
 Config: ~/.config/heavy/config.json. State: /tmp/heavy-<uid>/. See README.md.
 """
 import ctypes
+import hashlib
 import fcntl
 import json
 import os
@@ -625,6 +628,169 @@ def watchdog(args):
         time.sleep(TICK)
 
 
+# --- agent notes -----------------------------------------------------------
+#
+# Agents only use the queue if their instructions say so. This keeps one marked
+# section in each agent's global instruction file, and never touches anything
+# outside the markers. The start marker carries a hash of what heavy wrote, so a
+# section someone has edited by hand is left exactly as it is.
+
+NOTES = os.path.join(os.path.dirname(os.path.dirname(os.path.realpath(__file__))), "agent-notes.md")
+AGENT_FILES = [
+    ("Claude Code", "~/.claude", "CLAUDE.md"),
+    ("Codex", "~/.codex", "AGENTS.md"),
+    ("Gemini CLI", "~/.gemini", "GEMINI.md"),
+]
+START = re.compile(r"^<!-- heavy:start sha=([0-9a-f]{12}) .*-->\n", re.M)
+END = "<!-- heavy:end -->\n"
+
+
+def digest(text):
+    return hashlib.sha256(text.encode()).hexdigest()[:12]
+
+
+def notes_block():
+    with open(NOTES) as f:
+        body = f.read().rstrip("\n") + "\n"
+    head = ("<!-- heavy:start sha=%s Added by heavy (github.com/bigblueboo/heavy). "
+            "`heavy agent-notes remove` takes it out; edit inside and heavy stops updating it. -->\n"
+            % digest(body))
+    return head + body + END
+
+
+def find_block(text):
+    """(start, end, untouched) for heavy's section, or None."""
+    m = START.search(text)
+    if not m:
+        return None
+    end = text.find(END, m.end())
+    if end < 0:
+        return None
+    return m.start(), end + len(END), digest(text[m.end():end]) == m.group(1)
+
+
+def agent_targets():
+    """(agent, path) for each installed agent, one entry per real file."""
+    seen, out = set(), []
+    for agent, home, name in AGENT_FILES:
+        home = os.path.expanduser(home)
+        if not os.path.isdir(home):
+            continue
+        path = os.path.join(home, name)
+        real = os.path.realpath(path)
+        if real not in seen:
+            seen.add(real)
+            out.append((agent, path))
+    return out
+
+
+def read_text(path):
+    try:
+        with open(path) as f:
+            return f.read()
+    except FileNotFoundError:
+        return None
+
+
+def write_text(path, text):
+    """Replace the file's contents in place, through any symlink, keeping its permissions."""
+    real = os.path.realpath(path)
+    tmp = "%s.heavy-%d.tmp" % (real, os.getpid())
+    with open(tmp, "w") as f:
+        f.write(text)
+    if os.path.exists(real):
+        os.chmod(tmp, os.stat(real).st_mode & 0o7777)
+    os.replace(tmp, real)
+
+
+def note_state(path, block):
+    text = read_text(path)
+    found = find_block(text or "")
+    if text is None:
+        return "no file yet"
+    if not found:
+        return "no heavy section"
+    start, end, untouched = found
+    if not untouched:
+        return "has a heavy section you edited (left alone)"
+    return "up to date" if text[start:end] == block else "has an older heavy section"
+
+
+def agent_notes(args):
+    action = args[0] if args and not args[0].startswith("-") else "show"
+    yes = "--yes" in args
+    if action not in ("show", "install", "remove"):
+        raise SystemExit("heavy: agent-notes takes show, install or remove")
+    block = notes_block()
+    targets = agent_targets()
+    home = os.path.expanduser("~")
+    if not targets:
+        print("No coding agents found (looked for %s)."
+              % ", ".join(h for _a, h, _n in AGENT_FILES))
+        return 0
+
+    if action == "show":
+        for agent, path in targets:
+            print("%-12s %-28s %s" % (agent, path.replace(home, "~", 1), note_state(path, block)))
+        print("\nThe section heavy adds (from %s):\n" % NOTES)
+        print(block, end="")
+        return 0
+
+    if action == "install":
+        missing = [(a, p) for a, p in targets if not find_block(read_text(p) or "")]
+        if missing and not yes:
+            if not sys.stdin.isatty():
+                print("Skipped adding heavy's section to your agents' instructions. "
+                      "Run `heavy agent-notes install` to add it.")
+                missing = []
+            else:
+                print("Agents only use the queue if their instructions say so. heavy can add a short,")
+                print("marked section to the end of:")
+                for agent, path in missing:
+                    print("  %s (%s)" % (path.replace(home, "~", 1), agent))
+                print("It changes nothing else in those files, and `./install.sh --uninstall` takes it out.")
+                print("`heavy agent-notes show` prints the section.")
+                try:
+                    answer = input("Add it? [y/N] ").strip().lower()
+                except EOFError:
+                    answer = ""
+                    print()
+                if answer not in ("y", "yes"):
+                    print("Left them alone. Run `heavy agent-notes install` any time.")
+                    missing = []
+        adding = {p for _a, p in missing}
+
+    for agent, path in targets:
+        text = read_text(path)
+        found = find_block(text or "")
+        short = path.replace(home, "~", 1)
+        if action == "remove":
+            if not found:
+                continue
+            start, end, untouched = found
+            if not untouched and not yes:
+                print("%s: you edited heavy's section, so it stays. `heavy agent-notes remove --yes` "
+                      "removes it anyway." % short)
+                continue
+            before, after = text[:start].rstrip("\n"), text[end:].lstrip("\n")
+            rest = before + ("\n\n" if before and after else "\n" if before else "") + after
+            write_text(path, rest)
+            print("%s: removed heavy's section" % short)
+            continue
+        if found:
+            start, end, untouched = found
+            if not untouched:
+                print("%s: you edited heavy's section, so it was left as it is" % short)
+            elif text[start:end] != block:
+                write_text(path, text[:start] + block + text[end:])
+                print("%s: updated heavy's section" % short)
+        elif path in adding:
+            base = (text or "").rstrip("\n")
+            write_text(path, (base + "\n\n" if base else "") + block)
+            print("%s: added heavy's section at the end" % short)
+    return 0
+
+
 def main(argv):
     if not argv or argv[0] in ("help", "-h", "--help"):
         print(__doc__.strip())
@@ -636,6 +802,8 @@ def main(argv):
         return status()
     if cmd == "config" and not rest:
         return show_config()
+    if cmd == "agent-notes":
+        return agent_notes(rest)
     if cmd == "watchdog":
         return watchdog(rest)
     if cmd == "quiet" and len(rest) <= 1:

@@ -28,9 +28,9 @@ cd heavy
 ./install.sh
 ```
 
-`install.sh` doesn't need sudo. It links `bin/heavy` into `~/.local/bin` (set `HEAVY_BIN_DIR` to put it somewhere else), writes a starter config to `~/.config/heavy/config.json` if you don't have one, and starts the watchdog as a launchd agent called `com.github.bigblueboo.heavy`, which logs to `~/Library/Logs/heavy.log`.
+`install.sh` doesn't need sudo. It links `bin/heavy` into `~/.local/bin` (set `HEAVY_BIN_DIR` to put it somewhere else), writes a starter config to `~/.config/heavy/config.json` if you don't have one, and starts the watchdog as a launchd agent called `com.github.bigblueboo.heavy`, which logs to `~/Library/Logs/heavy.log`. Then it asks whether to tell your coding agents about the queue (see [Tell your agents](#tell-your-agents)). Pass `--agent-notes` to say yes up front or `--no-agent-notes` to skip the question.
 
-Leave the clone where it is, since the link and the agent point into it. To update, `git pull` and run `./install.sh` again. To remove it, `./install.sh --uninstall`.
+Leave the clone where it is, since the link and the agent point into it. To update, `git pull` and run `./install.sh` again. To remove everything it added, `./install.sh --uninstall`. Your config stays behind in case you come back.
 
 ## Use
 
@@ -126,25 +126,33 @@ It only touches your own processes, and only jobs that are safe to rerun. If the
 
 ## Tell your agents
 
-Agents won't use the queue unless their instructions say to. Put something like this where every session reads it: `~/.claude/CLAUDE.md` for Claude Code, `~/.codex/AGENTS.md` for Codex.
+Agents won't use the queue unless their instructions say to, so heavy can add a short section to the global instruction file of each coding agent you have installed:
 
-```markdown
-## Tests, type-checks and builds go through `heavy`
+| Agent | File |
+| --- | --- |
+| Claude Code | `~/.claude/CLAUDE.md` |
+| Codex | `~/.codex/AGENTS.md` |
+| Gemini CLI | `~/.gemini/GEMINI.md` |
 
-This machine is shared by many projects and agent sessions. Prefix every test run, type-check
-and build with `heavy`, for example `heavy npx tsc --noEmit`.
+The section is [agent-notes.md](agent-notes.md). It's written to be dropped into files that already hold someone's carefully tuned instructions, so it behaves like a polite houseguest:
 
-- It waits for a free slot, then runs the command and exits with the command's own code. While it
-  waits it prints `heavy: queued`. The wait can be many minutes: allow a long timeout or run it in
-  the background. Being queued is never a reason to run the command without `heavy`.
-- One heavy command per session at a time, scoped as tightly as the change allows.
-- Exit 75 with "stopped by the pressure breaker" means the machine ran out of headroom. Check
-  `heavy status` and rerun once the pressure is ok.
-- Dev servers and anything long-lived stay outside `heavy`.
-- If the user asks for quiet, run `heavy quiet 2h`. `heavy normal` undoes it.
+- It asks first. `install.sh` lists the files and waits for a yes, and without a terminal to ask in, it skips the step and says how to do it later.
+- It only goes where an agent is installed, judged by whether `~/.claude`, `~/.codex` or `~/.gemini` exists.
+- It sits at the end of the file between `<!-- heavy:start -->` and `<!-- heavy:end -->` comments, and nothing outside those markers is ever changed.
+- Rerunning the installer after a `git pull` updates the section in place, so it never ends up in a file twice.
+- If you edit inside the markers, heavy notices (the start marker carries a hash of what it wrote) and stops updating or removing that section. It's yours now.
+- If two of those paths are symlinks to the same file, as they are in a lot of dotfiles setups, the section is written once, through the link.
+- `./install.sh --uninstall` removes the section and leaves the file the way it was before.
+
+You can also run it by hand:
+
+```
+heavy agent-notes show       # each file's state, and the section itself
+heavy agent-notes install    # add or update it (asks before adding)
+heavy agent-notes remove     # take it out
 ```
 
-The line about being queued is there because an agent that sees a wait will otherwise reason its way around it.
+If you'd rather write your own, the one rule worth keeping is the one about waiting: an agent that sees `heavy: queued` and isn't told otherwise will reason its way around the queue.
 
 ## How it works
 

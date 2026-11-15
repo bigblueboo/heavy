@@ -303,5 +303,106 @@ class Breaker(Sandbox):
         older.terminate()
 
 
+class AgentNotes(Sandbox):
+    """Runs against a fake HOME, so the real instruction files are never read or written."""
+
+    def setUp(self):
+        super().setUp()
+        self.home = os.path.join(self.tmp.name, "home")
+        os.makedirs(os.path.join(self.home, ".claude"))
+        os.makedirs(os.path.join(self.home, ".codex"))
+        self.env["HOME"] = self.home
+        self.claude = os.path.join(self.home, ".claude", "CLAUDE.md")
+        self.codex = os.path.join(self.home, ".codex", "AGENTS.md")
+        self.gemini = os.path.join(self.home, ".gemini", "GEMINI.md")
+
+    def notes(self, *args, stdin=None):
+        return subprocess.run([HEAVY, "agent-notes", *args], env=self.env, capture_output=True,
+                              text=True, stdin=stdin or subprocess.DEVNULL)
+
+    def text(self, path):
+        with open(path) as f:
+            return f.read()
+
+    def write(self, path, text):
+        with open(path, "w") as f:
+            f.write(text)
+
+    def test_without_consent_nothing_is_written(self):
+        self.write(self.claude, "# Mine\n")
+        out = self.notes("install")
+        self.assertIn("Skipped", out.stdout)
+        self.assertEqual(self.text(self.claude), "# Mine\n")
+        self.assertFalse(os.path.exists(self.codex))
+
+    def test_install_appends_to_installed_agents_only_and_keeps_the_rest(self):
+        mine = "# Mine\n\nKeep this exactly.\n"
+        self.write(self.claude, mine)
+        self.notes("install", "--yes")
+        claude = self.text(self.claude)
+        self.assertTrue(claude.startswith(mine + "\n<!-- heavy:start sha="))
+        self.assertTrue(claude.endswith("<!-- heavy:end -->\n"))
+        self.assertIn("heavy npx tsc --noEmit", self.text(self.codex))
+        self.assertFalse(os.path.exists(os.path.dirname(self.gemini)))  # Gemini isn't installed
+
+    def test_gemini_is_covered_when_present(self):
+        os.makedirs(os.path.dirname(self.gemini))
+        self.notes("install", "--yes")
+        self.assertIn("<!-- heavy:end -->", self.text(self.gemini))
+
+    def test_install_twice_changes_nothing(self):
+        self.notes("install", "--yes")
+        first = self.text(self.claude)
+        self.assertEqual(self.notes("install").stdout, "")
+        self.assertEqual(self.text(self.claude), first)
+
+    def test_an_older_section_is_updated_in_place_without_asking(self):
+        self.notes("install", "--yes")
+        h = self.module()
+        stale_body = "old advice\n"
+        stale = "<!-- heavy:start sha=%s old -->\n%s<!-- heavy:end -->\n" % (h.digest(stale_body), stale_body)
+        self.write(self.claude, "above\n\n" + stale + "\nbelow\n")
+        out = self.notes("install")
+        self.assertIn("updated", out.stdout)
+        text = self.text(self.claude)
+        self.assertTrue(text.startswith("above\n\n<!-- heavy:start"))
+        self.assertTrue(text.endswith("<!-- heavy:end -->\n\nbelow\n"))
+        self.assertNotIn("old advice", text)
+
+    def test_a_hand_edited_section_is_left_alone(self):
+        self.notes("install", "--yes")
+        edited = self.text(self.claude).replace("heavy quiet 2h", "heavy quiet 4h")
+        self.write(self.claude, edited)
+        self.assertIn("left as it is", self.notes("install").stdout)
+        self.assertEqual(self.text(self.claude), edited)
+        self.assertIn("stays", self.notes("remove").stdout)
+        self.assertEqual(self.text(self.claude), edited)
+        self.notes("remove", "--yes")
+        self.assertNotIn("heavy:start", self.text(self.claude))
+
+    def test_remove_restores_the_file(self):
+        mine = "# Mine\n\nKeep this exactly.\n"
+        self.write(self.claude, mine)
+        self.notes("install", "--yes")
+        self.notes("remove")
+        self.assertEqual(self.text(self.claude), mine)
+
+    def test_a_symlinked_file_is_written_once_through_the_link(self):
+        dotfile = os.path.join(self.tmp.name, "dotfiles-agents.md")
+        self.write(dotfile, "shared\n")
+        os.symlink(dotfile, self.claude)
+        os.symlink(dotfile, self.codex)
+        self.notes("install", "--yes")
+        self.assertTrue(os.path.islink(self.claude))
+        self.assertEqual(self.text(dotfile).count("heavy:start"), 1)
+
+    def test_show_reports_each_file(self):
+        self.write(self.claude, "# Mine\n")
+        out = self.notes("show").stdout
+        self.assertIn("no heavy section", out)
+        self.assertIn("no file yet", out)
+        self.assertIn("<!-- heavy:end -->", out)
+
+
 if __name__ == "__main__":
     unittest.main()
